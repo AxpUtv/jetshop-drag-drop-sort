@@ -3,7 +3,7 @@
 // @namespace    https://github.com/AxpUtv/jetshop-drag-drop-sort
 // @version      1.0.0
 // @description  Dra och släpp för att sortera om rader i Jetshop-admin (filterlistan och kategoriproduktlistan). Ctrl-klick markerar flera rader att flytta samtidigt.
-// @author       ArkDev
+// @author       ArkUtv
 // @match        *://*/admin/Administration/Products/Filtering.aspx*
 // @match        *://*/admin/Administration/Products/AddEditCategoryProductList.aspx*
 // @run-at       document-idle
