@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jetshop Admin - Dra och släpp-sortering
 // @namespace    https://github.com/AxpUtv/jetshop-drag-drop-sort
-// @version      1.0.0
+// @version      1.1.0
 // @description  Dra och släpp för att sortera om rader i Jetshop-admin (filterlistan och kategoriproduktlistan). Ctrl-klick markerar flera rader att flytta samtidigt.
 // @author       ArkUtv
 // @downloadURL  https://raw.githubusercontent.com/AxpUtv/jetshop-drag-drop-sort/main/jetshop-drag-drop-sort.user.js
@@ -80,7 +80,7 @@
                 const grip = document.createElement('span');
                 grip.className = 'jsdd-handle';
                 grip.textContent = '⠇'; // ⠇-liknande grepp-ikon
-                grip.draggable = true;
+                // Medvetet INTE draggable - se kommentaren vid attachHandlers.
                 grip.title = 'Dra för att flytta raden.\nCtrl-klick markerar flera rader.\nShift-klick markerar ett intervall.';
                 td.appendChild(grip);
 
@@ -134,6 +134,85 @@
     }
 
     // ---- Händelsehantering (delegerad på tabellen) ------------------------
+    //
+    // Dragningen bygger på pekarhändelser, inte på HTML5 dra och släpp.
+    //
+    // Version 1.0 använde draggable + dragstart/drop/dragend. Den dragningen
+    // körs av operativsystemet, och fastnar den kommer dragend aldrig fram.
+    // Då blev raden kvar halvgenomskinlig, pekaren stod som en greppande hand
+    // över hela sidan och ingen ny dragning gick att starta förrän sidan
+    // laddades om. Städningen låg i dragend och fick aldrig köra.
+    //
+    // Med pointerdown + setPointerCapture äger sidan hela förloppet själv.
+    // Varje sätt en dragning kan ta slut på - släpp, pointercancel, förlorad
+    // capture, fönsterbyte, Esc, en UpdatePanel-postback - leder till samma
+    // städfunktion.
+
+    const DRAG_THRESHOLD = 4;   // px innan en nedtryckning räknas som dragning
+    const SCROLL_EDGE = 50;     // px från fönsterkanten där autoscroll startar
+    const SCROLL_MAX = 18;      // px per bildruta vid kanten
+
+    let drag = null;
+
+    function endDrag(commit) {
+        const d = drag;
+        if (!d) return;
+        drag = null;
+
+        cancelAnimationFrame(d.raf);
+        try {
+            if (d.grip.hasPointerCapture && d.grip.hasPointerCapture(d.pointerId)) {
+                d.grip.releasePointerCapture(d.pointerId);
+            }
+        } catch (_) { /* elementet kan redan vara borta */ }
+
+        document.documentElement.classList.remove('jsdd-active');
+        getDragImage().classList.remove('jsdd-dragimage-show');
+        d.group.forEach(r => r.classList.remove('jsdd-dragging'));
+        clearIndicators(d.table);
+
+        // Har en postback bytt ut tabellen under tiden finns inget att flytta.
+        if (commit && d.started && d.target && d.table.isConnected
+            && d.target.row.isConnected && d.group.every(r => r.isConnected)) {
+            moveRows(d.group, d.target.row, d.target.after);
+            renumber(d.table, d.cfg);
+            toast('Ny ordning satt. Klicka Spara för att spara.');
+        }
+    }
+
+    function updateTarget(d, x, y) {
+        const img = getDragImage();
+        img.style.left = (x + 14) + 'px';
+        img.style.top = (y + 10) + 'px';
+
+        clearIndicators(d.table);
+        d.target = null;
+
+        const el = document.elementFromPoint(x, y);
+        const row = el && el.closest('tr');
+        if (!row || !d.table.contains(row) || !isDataRow(row, d.cfg)) return;
+        if (d.group.includes(row)) return;
+
+        const rect = row.getBoundingClientRect();
+        const after = (y - rect.top) > rect.height / 2;
+        row.classList.add(after ? 'jsdd-drop-below' : 'jsdd-drop-above');
+        d.target = { row, after };
+    }
+
+    // Autoscroll när pekaren står nära över- eller underkanten. Utan den gick
+    // det inte att flytta en rad längre än det som syntes på skärmen.
+    function scrollLoop() {
+        const d = drag;
+        if (!d || !d.started) return;
+        let dy = 0;
+        if (d.y < SCROLL_EDGE) dy = -Math.ceil(SCROLL_MAX * (1 - d.y / SCROLL_EDGE));
+        else if (d.y > innerHeight - SCROLL_EDGE) dy = Math.ceil(SCROLL_MAX * (1 - (innerHeight - d.y) / SCROLL_EDGE));
+        if (dy) {
+            window.scrollBy(0, dy);
+            updateTarget(d, d.x, d.y);
+        }
+        d.raf = requestAnimationFrame(scrollLoop);
+    }
 
     function attachHandlers(table, cfg) {
         if (table.dataset.jsddBound) return;
@@ -162,64 +241,72 @@
             }
         });
 
-        // Drag startar.
-        table.addEventListener('dragstart', (e) => {
+        // Nedtryckning på greppet. Själva dragningen startar först när pekaren
+        // rört sig förbi tröskeln, så att Ctrl- och Shift-klick fortfarande är
+        // rena klick.
+        table.addEventListener('pointerdown', (e) => {
             const grip = e.target.closest('.jsdd-handle');
-            if (!grip) return;
+            if (!grip || e.button !== 0) return;
+            if (e.ctrlKey || e.metaKey || e.shiftKey) return; // markering, se click
             const row = grip.closest('tr');
             if (!row || !isDataRow(row, cfg)) return;
 
-            const selected = getSelected(table, cfg);
-            let group;
-            if (row.classList.contains('jsdd-selected') && selected.length) {
-                group = selected;
-            } else {
-                clearSelection(table, cfg);
-                group = [row];
+            endDrag(false); // om en tidigare dragning mot förmodan hänger kvar
+            e.preventDefault(); // ingen textmarkering och ingen inbyggd dragning
+
+            drag = {
+                table, cfg, grip, row,
+                pointerId: e.pointerId,
+                startX: e.clientX, startY: e.clientY,
+                x: e.clientX, y: e.clientY,
+                started: false, group: [], target: null, raf: 0,
+            };
+            try { grip.setPointerCapture(e.pointerId); } catch (_) { /* ignoreras */ }
+        });
+
+        table.addEventListener('pointermove', (e) => {
+            const d = drag;
+            if (!d || d.table !== table || e.pointerId !== d.pointerId) return;
+            d.x = e.clientX;
+            d.y = e.clientY;
+
+            if (!d.started) {
+                if (Math.abs(d.y - d.startY) < DRAG_THRESHOLD
+                    && Math.abs(d.x - d.startX) < DRAG_THRESHOLD) return;
+
+                const selected = getSelected(table, cfg);
+                if (d.row.classList.contains('jsdd-selected') && selected.length) {
+                    d.group = selected;
+                } else {
+                    clearSelection(table, cfg);
+                    d.group = [d.row];
+                }
+                d.group.forEach(r => r.classList.add('jsdd-dragging'));
+                d.started = true;
+
+                const img = getDragImage();
+                img.textContent = d.group.length > 1 ? (d.group.length + ' rader flyttas') : 'Flyttar rad';
+                img.classList.add('jsdd-dragimage-show');
+                document.documentElement.classList.add('jsdd-active');
+                d.raf = requestAnimationFrame(scrollLoop);
             }
-            group.forEach(r => r.classList.add('jsdd-dragging'));
-            table._jsddGroup = group;
 
-            e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', 'jsdd'); // krävs av Firefox
-
-            const img = getDragImage();
-            img.textContent = group.length > 1 ? (group.length + ' rader flyttas') : 'Flyttar rad';
-            try { e.dataTransfer.setDragImage(img, 12, 12); } catch (_) { /* ignoreras */ }
-        });
-
-        // Under dragning: visa var raden hamnar.
-        table.addEventListener('dragover', (e) => {
-            if (!table._jsddGroup) return;
-            const row = e.target.closest('tr');
-            if (!row || !isDataRow(row, cfg)) return;
             e.preventDefault();
-            e.dataTransfer.dropEffect = 'move';
-
-            clearIndicators(table);
-            const rect = row.getBoundingClientRect();
-            const after = (e.clientY - rect.top) > rect.height / 2;
-            row.classList.add(after ? 'jsdd-drop-below' : 'jsdd-drop-above');
-            table._jsddTarget = { row, after };
+            updateTarget(d, d.x, d.y);
         });
 
-        table.addEventListener('drop', (e) => {
-            if (!table._jsddGroup) return;
-            e.preventDefault();
-            const t = table._jsddTarget;
-            const group = table._jsddGroup;
-            if (t && group && group.length) {
-                moveRows(group, t.row, t.after);
-                renumber(table, cfg);
-                toast('Ny ordning satt. Klicka Spara för att spara.');
-            }
+        table.addEventListener('pointerup', (e) => {
+            if (!drag || drag.table !== table || e.pointerId !== drag.pointerId) return;
+            endDrag(true);
         });
 
-        table.addEventListener('dragend', () => {
-            (table._jsddGroup || []).forEach(r => r.classList.remove('jsdd-dragging'));
-            clearIndicators(table);
-            table._jsddGroup = null;
-            table._jsddTarget = null;
+        // Avbrott utan släpp: webbläsaren tog över pekaren, capture tappades
+        // eller ett annat fönster fick fokus. Inget flyttas.
+        table.addEventListener('pointercancel', () => endDrag(false));
+        table.addEventListener('lostpointercapture', () => {
+            // Tappad capture följer normalt direkt på pointerup, som redan
+            // städat. Kommer den utan pointerup är dragningen avbruten.
+            if (drag && drag.table === table) endDrag(false);
         });
     }
 
@@ -236,13 +323,19 @@
         });
     }
 
-    // Esc rensar markeringen.
+    // Esc avbryter en pågående dragning, annars rensar den markeringen.
     document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') {
-            document.querySelectorAll('tr.jsdd-selected')
-                .forEach(r => r.classList.remove('jsdd-selected'));
+        if (e.key !== 'Escape') return;
+        if (drag) {
+            endDrag(false);
+            return;
         }
+        document.querySelectorAll('tr.jsdd-selected')
+            .forEach(r => r.classList.remove('jsdd-selected'));
     });
+
+    // Alt-Tab eller klick i ett annat fönster mitt i en dragning.
+    window.addEventListener('blur', () => endDrag(false));
 
     // ---- Stilmall ---------------------------------------------------------
 
@@ -258,9 +351,12 @@
         .jsdd-handle {
             display: inline-block; cursor: grab; color: #888;
             font-size: 16px; line-height: 1; padding: 4px 2px; user-select: none;
+            touch-action: none;
         }
         .jsdd-handle:hover { color: #1a4b73; }
-        .jsdd-handle:active { cursor: grabbing; }
+        /* Greppande hand bara medan en dragning faktiskt pågår. Klassen tas
+           bort av endDrag, som alla vägar ut ur en dragning går genom. */
+        html.jsdd-active, html.jsdd-active * { cursor: grabbing !important; user-select: none !important; }
         tr.jsdd-selected > td { background: #dbeeff !important; }
         tr.jsdd-dragging { opacity: 0.45; }
         tr.jsdd-drop-above > td { box-shadow: inset 0 3px 0 -1px #2b7de9; }
@@ -271,11 +367,13 @@
             to   { background: transparent; }
         }
         .jsdd-dragimage {
-            position: fixed; top: -1000px; left: -1000px;
+            position: fixed; top: -1000px; left: -1000px; z-index: 99999;
+            pointer-events: none; display: none;
             background: #2b7de9; color: #fff; padding: 4px 10px;
             border-radius: 4px; font-size: 12px; font-family: sans-serif;
             white-space: nowrap; box-shadow: 0 2px 6px rgba(0,0,0,.3);
         }
+        .jsdd-dragimage.jsdd-dragimage-show { display: block; }
         .jsdd-toast {
             position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(20px);
             background: #333; color: #fff; padding: 10px 16px; border-radius: 4px;
@@ -312,6 +410,8 @@
         try {
             if (window.Sys && Sys.WebForms && Sys.WebForms.PageRequestManager) {
                 const prm = Sys.WebForms.PageRequestManager.getInstance();
+                // En postback mitt i en dragning byter ut raderna under oss.
+                prm.add_initializeRequest(function () { endDrag(false); });
                 prm.add_endRequest(function () { setTimeout(init, 0); });
                 return true;
             }
